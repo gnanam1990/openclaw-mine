@@ -1,3 +1,4 @@
+// Memory Wiki plugin module implements lint behavior.
 import fs from "node:fs/promises";
 import path from "node:path";
 import {
@@ -54,6 +55,7 @@ function collectBrokenLinkIssues(pages: WikiPageSummary[]): MemoryWikiLintIssue[
   const validTargets = new Set<string>();
   for (const page of pages) {
     const withoutExtension = page.relativePath.replace(/\.md$/i, "");
+    validTargets.add(page.relativePath);
     validTargets.add(withoutExtension);
     validTargets.add(path.basename(withoutExtension));
   }

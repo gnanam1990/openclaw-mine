@@ -1,6 +1,8 @@
+// Plugin uninstall command implementation and confirmation-driven removal plan execution.
 import os from "node:os";
 import path from "node:path";
-import { readConfigFileSnapshot } from "../config/config.js";
+import { theme } from "../../packages/terminal-core/src/theme.js";
+import { assertConfigWriteAllowedInCurrentMode, readConfigFileSnapshot } from "../config/config.js";
 import { resolveStateDir } from "../config/paths.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
@@ -8,7 +10,6 @@ import {
   tracePluginLifecyclePhaseAsync,
 } from "../plugins/plugin-lifecycle-trace.js";
 import { defaultRuntime, type RuntimeEnv } from "../runtime.js";
-import { theme } from "../terminal/theme.js";
 import { shortenHomePath } from "../utils.js";
 
 export type PluginUninstallOptions = {
@@ -17,13 +18,24 @@ export type PluginUninstallOptions = {
   keepConfig?: boolean;
   force?: boolean;
   dryRun?: boolean;
+  invalidateRuntimeCache?: boolean;
 };
+
+function isPromptInputClosedError(
+  error: unknown,
+  PromptInputClosedError: typeof import("./prompt.js").PromptInputClosedError,
+): error is InstanceType<typeof PromptInputClosedError> {
+  return error instanceof PromptInputClosedError;
+}
 
 export async function runPluginUninstallCommand(
   id: string,
   opts: PluginUninstallOptions = {},
   runtime: RuntimeEnv = defaultRuntime,
 ): Promise<void> {
+  // Uninstall mutates config/install records and optionally managed files, so guard write mode first.
+  assertConfigWriteAllowedInCurrentMode();
+
   const {
     loadInstalledPluginIndexInstallRecords,
     removePluginInstallRecordFromRecords,
@@ -44,7 +56,7 @@ export async function runPluginUninstallCommand(
   const { refreshPluginRegistryAfterConfigMutation } =
     await import("./plugins-registry-refresh.js");
   const { resolvePluginUninstallId } = await import("./plugins-uninstall-selection.js");
-  const { promptYesNo } = await import("./prompt.js");
+  const { PromptInputClosedError, promptYesNo } = await import("./prompt.js");
   const snapshot = await tracePluginLifecyclePhaseAsync(
     "config read",
     () => readConfigFileSnapshot(),
@@ -74,21 +86,6 @@ export async function runPluginUninstallCommand(
     config: cfg,
     plugins: report.plugins,
   });
-  const hasEntry = pluginId in (cfg.plugins?.entries ?? {});
-  const hasInstall = pluginId in (cfg.plugins?.installs ?? {});
-
-  if (!hasEntry && !hasInstall) {
-    if (plugin) {
-      runtime.error(
-        `Plugin "${pluginId}" is not managed by plugins config/install records and cannot be uninstalled.`,
-      );
-    } else {
-      runtime.error(`Plugin not found: ${id}`);
-    }
-    runtime.exit(1);
-    return;
-  }
-
   const channelIds = plugin?.status === "loaded" ? plugin.channelIds : undefined;
   const plan = planPluginUninstall({
     config: cfg,
@@ -98,10 +95,17 @@ export async function runPluginUninstallCommand(
     extensionsDir,
   });
   if (!plan.ok) {
-    runtime.error(plan.error);
+    if (plugin) {
+      runtime.error(
+        `Plugin "${pluginId}" is not managed by plugins config/install records and cannot be uninstalled.`,
+      );
+    } else {
+      runtime.error(plan.error);
+    }
     runtime.exit(1);
     return;
   }
+  const hasInstall = pluginId in (cfg.plugins?.installs ?? {});
 
   const preview: string[] = [];
   if (plan.actions.entry) {
@@ -151,7 +155,19 @@ export async function runPluginUninstallCommand(
   }
 
   if (!opts.force) {
-    const confirmed = await promptYesNo(`Uninstall plugin "${pluginId}"?`);
+    let confirmed: boolean;
+    try {
+      confirmed = await promptYesNo(`Uninstall plugin "${pluginId}"?`);
+    } catch (error) {
+      if (isPromptInputClosedError(error, PromptInputClosedError)) {
+        runtime.error(
+          "Error: plugins uninstall requires confirmation input. Re-run in an interactive TTY or pass --force.",
+        );
+        runtime.exit(1);
+        return;
+      }
+      throw error;
+    }
     if (!confirmed) {
       runtime.log("Cancelled.");
       return;
@@ -167,6 +183,9 @@ export async function runPluginUninstallCommand(
         nextInstallRecords,
         nextConfig,
         ...(snapshot.hash !== undefined ? { baseHash: snapshot.hash } : {}),
+        writeOptions: {
+          afterWrite: { mode: "restart", reason: "plugin source changed" },
+        },
       }),
     { command: "uninstall" },
   );
@@ -178,6 +197,7 @@ export async function runPluginUninstallCommand(
     config: nextConfig,
     reason: "source-changed",
     installRecords: nextInstallRecords,
+    invalidateRuntimeCache: opts.invalidateRuntimeCache,
     traceCommand: "uninstall",
     logger: {
       warn: (message) => runtime.log(theme.warn(message)),

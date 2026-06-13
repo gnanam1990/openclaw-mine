@@ -1,8 +1,11 @@
-import type { OpenClawConfig } from "openclaw/plugin-sdk/config-types";
+// Discord provider module implements model/runtime integration.
+import path from "node:path";
+import type { OpenClawConfig } from "openclaw/plugin-sdk/config-contracts";
 import { isDangerousNameMatchingEnabled } from "openclaw/plugin-sdk/dangerous-name-runtime";
 import { danger } from "openclaw/plugin-sdk/runtime-env";
 import type { RuntimeEnv } from "openclaw/plugin-sdk/runtime-env";
-import { normalizeOptionalString } from "openclaw/plugin-sdk/text-runtime";
+import { resolveStateDir } from "openclaw/plugin-sdk/state-paths";
+import { normalizeOptionalString } from "openclaw/plugin-sdk/string-coerce-runtime";
 import {
   Client,
   ReadyListener,
@@ -14,7 +17,7 @@ import {
 import type { GatewayPlugin } from "../internal/gateway.js";
 import { VoicePlugin } from "../internal/voice.js";
 import { parseApplicationIdFromToken } from "../probe.js";
-import { createDiscordRequestClient, DISCORD_REST_TIMEOUT_MS } from "../proxy-request-client.js";
+import { DISCORD_REST_TIMEOUT_MS } from "../proxy-request-client.js";
 import type { DiscordGuildEntryResolved } from "./allow-list.js";
 import { createDiscordAutoPresenceController } from "./auto-presence.js";
 import type { DiscordDmPolicy } from "./dm-command-auth.js";
@@ -86,7 +89,7 @@ export async function createDiscordMonitorClient(params: {
   accountId: string;
   applicationId: string;
   token: string;
-  proxyFetch?: typeof fetch;
+  restFetch?: typeof fetch;
   commands: BaseCommand[];
   components: BaseMessageInteractiveComponent[];
   modals: Modal[];
@@ -136,10 +139,16 @@ export async function createDiscordMonitorClient(params: {
       publicKey: "a",
       token: params.token,
       autoDeploy: false,
+      commandDeployHashStorePath: path.join(
+        resolveStateDir(process.env),
+        "discord",
+        "command-deploy-cache.json",
+      ),
       requestOptions: {
         timeout: DISCORD_REST_TIMEOUT_MS,
         runtimeProfile: "persistent",
         maxQueueSize: 1000,
+        ...(params.restFetch ? { fetch: params.restFetch } : {}),
       },
       eventQueue: eventQueueOpts,
     },
@@ -153,14 +162,6 @@ export async function createDiscordMonitorClient(params: {
   );
   if (voicePlugin) {
     registerLatePlugin(client, voicePlugin);
-  }
-  if (params.proxyFetch) {
-    client.rest = createDiscordRequestClient(params.token, {
-      fetch: params.proxyFetch,
-      timeout: DISCORD_REST_TIMEOUT_MS,
-      runtimeProfile: "persistent",
-      maxQueueSize: 1000,
-    });
   }
   const gateway = client.getPlugin<GatewayPlugin>("gateway") as MutableDiscordGateway | undefined;
   await waitForDiscordGatewayPluginRegistration(gateway);
@@ -263,30 +264,32 @@ export function registerDiscordMonitorListeners(params: {
     new DiscordMessageListener(params.messageHandler, params.logger, params.trackInboundEvent),
   );
 
-  const reactionListenerOptions: ConstructorParameters<typeof DiscordReactionListener>[0] = {
-    cfg: params.cfg,
-    accountId: params.accountId,
-    runtime: params.runtime,
-    botUserId: params.botUserId,
-    dmEnabled: params.dmEnabled,
-    groupDmEnabled: params.groupDmEnabled,
-    groupDmChannels: params.groupDmChannels ?? [],
-    dmPolicy: params.dmPolicy,
-    allowFrom: params.allowFrom ?? [],
-    groupPolicy: params.groupPolicy,
-    allowNameMatching: isDangerousNameMatchingEnabled(params.discordConfig),
-    guildEntries: params.guildEntries,
-    logger: params.logger,
-    onEvent: params.trackInboundEvent,
-  };
-  registerDiscordListener(
-    params.client.listeners,
-    new DiscordReactionListener(reactionListenerOptions),
-  );
-  registerDiscordListener(
-    params.client.listeners,
-    new DiscordReactionRemoveListener(reactionListenerOptions),
-  );
+  if (shouldRegisterDiscordReactionListeners(params)) {
+    const reactionListenerOptions: ConstructorParameters<typeof DiscordReactionListener>[0] = {
+      cfg: params.cfg,
+      accountId: params.accountId,
+      runtime: params.runtime,
+      botUserId: params.botUserId,
+      dmEnabled: params.dmEnabled,
+      groupDmEnabled: params.groupDmEnabled,
+      groupDmChannels: params.groupDmChannels ?? [],
+      dmPolicy: params.dmPolicy,
+      allowFrom: params.allowFrom ?? [],
+      groupPolicy: params.groupPolicy,
+      allowNameMatching: isDangerousNameMatchingEnabled(params.discordConfig),
+      guildEntries: params.guildEntries,
+      logger: params.logger,
+      onEvent: params.trackInboundEvent,
+    };
+    registerDiscordListener(
+      params.client.listeners,
+      new DiscordReactionListener(reactionListenerOptions),
+    );
+    registerDiscordListener(
+      params.client.listeners,
+      new DiscordReactionRemoveListener(reactionListenerOptions),
+    );
+  }
   registerDiscordListener(
     params.client.listeners,
     new DiscordThreadUpdateListener(params.cfg, params.accountId, params.logger),
@@ -299,4 +302,23 @@ export function registerDiscordMonitorListeners(params: {
     );
     params.runtime.log?.("discord: GuildPresences intent enabled — presence listener registered");
   }
+}
+
+function shouldRegisterDiscordReactionListeners(params: {
+  dmEnabled: boolean;
+  groupDmEnabled: boolean;
+  groupPolicy: "open" | "allowlist" | "disabled";
+  guildEntries?: Record<string, DiscordGuildEntryResolved>;
+}): boolean {
+  if (params.dmEnabled || params.groupDmEnabled) {
+    return true;
+  }
+  if (params.groupPolicy === "disabled") {
+    return false;
+  }
+  const guildEntries = Object.values(params.guildEntries ?? {});
+  if (guildEntries.length === 0) {
+    return true;
+  }
+  return guildEntries.some((entry) => entry.reactionNotifications !== "off");
 }

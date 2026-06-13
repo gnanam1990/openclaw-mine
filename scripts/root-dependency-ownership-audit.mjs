@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+// Audits root package runtime dependencies against source imports and bundled
+// plugin ownership so extension-owned deps can move out of root.
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -19,7 +21,14 @@ const DYNAMIC_CONSTANT_IMPORT_PATTERNS = [
   /\brequire\s*\(\s*([_$A-Za-z][\w$]*)\s*\)/g,
   /\b(?:require|[_$A-Za-z][\w$]*require[\w$]*)\.resolve\s*\(\s*([_$A-Za-z][\w$]*)\s*\)/gi,
 ];
+const PACKAGE_FILE_LOOKUP_PATTERNS = [
+  /\bresolvePackageFileForCommandExplanation\s*\(\s*["']([^"']+)["']/g,
+];
 const ROOT_OWNED_EXTENSION_RUNTIME_DEPENDENCIES = new Map([
+  [
+    "@homebridge/ciao",
+    "keep at root; the Bonjour runtime is shipped with packaged startup surfaces even though the bundled plugin also declares it",
+  ],
   [
     "playwright-core",
     "keep at root; the internal browser runtime is shipped with core even though downloadable browser-adjacent plugins also declare it",
@@ -72,9 +81,19 @@ function sectionFor(relativePath) {
   return section;
 }
 
+/**
+ * Collects static and simple constant-backed package specifiers from source text.
+ */
 export function collectModuleSpecifiers(source) {
   const specifiers = new Set();
   for (const pattern of IMPORT_PATTERNS) {
+    for (const match of source.matchAll(pattern)) {
+      if (match[1]) {
+        specifiers.add(match[1]);
+      }
+    }
+  }
+  for (const pattern of PACKAGE_FILE_LOOKUP_PATTERNS) {
     for (const match of source.matchAll(pattern)) {
       if (match[1]) {
         specifiers.add(match[1]);
@@ -135,6 +154,54 @@ function collectExtensionDependencyDeclarations(repoRoot) {
   return declarations;
 }
 
+function collectExcludedPackagedExtensionDirs(rootPackageJson) {
+  const excluded = new Set();
+  for (const entry of rootPackageJson.files ?? []) {
+    if (typeof entry !== "string") {
+      continue;
+    }
+    const match = /^!dist\/extensions\/([^/]+)\/\*\*$/u.exec(entry);
+    if (match?.[1]) {
+      excluded.add(match[1]);
+    }
+  }
+  return excluded;
+}
+
+function collectInternalizedBundledExtensionRuntimeDependencies(repoRoot, rootPackageJson) {
+  const dependencies = new Map();
+  const extensionsRoot = path.join(repoRoot, "extensions");
+  if (!fs.existsSync(extensionsRoot)) {
+    return dependencies;
+  }
+
+  const excluded = collectExcludedPackagedExtensionDirs(rootPackageJson);
+  for (const entry of fs.readdirSync(extensionsRoot, { withFileTypes: true })) {
+    if (!entry.isDirectory() || excluded.has(entry.name)) {
+      continue;
+    }
+    const packageJsonPath = path.join(extensionsRoot, entry.name, "package.json");
+    const manifestPath = path.join(extensionsRoot, entry.name, "openclaw.plugin.json");
+    if (!fs.existsSync(packageJsonPath) || !fs.existsSync(manifestPath)) {
+      continue;
+    }
+    const packageJson = readJson(packageJsonPath);
+    for (const section of ["dependencies", "optionalDependencies"]) {
+      for (const depName of Object.keys(packageJson[section] ?? {})) {
+        const existing = dependencies.get(depName) ?? [];
+        existing.push(`${entry.name}:${section}`);
+        dependencies.set(depName, existing);
+      }
+    }
+  }
+
+  for (const values of dependencies.values()) {
+    values.sort((left, right) => left.localeCompare(right));
+  }
+
+  return dependencies;
+}
+
 function sectionSetContainsCore(sectionSet) {
   return sectionSet.has("src") || sectionSet.has("packages") || sectionSet.has("ui");
 }
@@ -148,6 +215,9 @@ function sectionSetIsSubsetOf(sectionSet, allowed) {
   return sectionSet.size > 0;
 }
 
+/**
+ * Classifies whether a root dependency is core-owned, shared, or extension-local.
+ */
 export function classifyRootDependencyOwnership(record) {
   const sections = new Set(record.sections);
 
@@ -190,6 +260,16 @@ export function classifyRootDependencyOwnership(record) {
     };
   }
 
+  if (
+    record.internalizedBundledRuntimeOwners?.length > 0 &&
+    sectionSetIsSubsetOf(sections, new Set(["extensions", "test"]))
+  ) {
+    return {
+      category: "root_owned_extension_runtime",
+      recommendation: `keep at root while bundled plugin runtime dependencies are internalized; owners: ${record.internalizedBundledRuntimeOwners.join(", ")}`,
+    };
+  }
+
   if (sectionSetIsSubsetOf(sections, new Set(["extensions", "test"]))) {
     return {
       category: "extension_only_localizable",
@@ -204,6 +284,9 @@ export function classifyRootDependencyOwnership(record) {
   };
 }
 
+/**
+ * Builds dependency ownership records from root package.json and scanned imports.
+ */
 export function collectRootDependencyOwnershipAudit(params = {}) {
   const repoRoot = path.resolve(params.repoRoot ?? process.cwd());
   const rootPackageJson = readJson(path.join(repoRoot, "package.json"));
@@ -219,6 +302,7 @@ export function collectRootDependencyOwnershipAudit(params = {}) {
         sections: new Set(),
         files: new Set(),
         declaredInExtensions: [],
+        internalizedBundledRuntimeOwners: [],
         spec: rootDependencies[depName],
       },
     ]),
@@ -249,6 +333,15 @@ export function collectRootDependencyOwnershipAudit(params = {}) {
     }
   }
 
+  const internalizedBundledRuntimeDependencies =
+    collectInternalizedBundledExtensionRuntimeDependencies(repoRoot, rootPackageJson);
+  for (const [depName, owners] of internalizedBundledRuntimeDependencies) {
+    const record = records.get(depName);
+    if (record) {
+      record.internalizedBundledRuntimeOwners = owners;
+    }
+  }
+
   return [...records.values()]
     .map((record) => {
       const classification = classifyRootDependencyOwnership({
@@ -262,6 +355,7 @@ export function collectRootDependencyOwnershipAudit(params = {}) {
         fileCount: record.files.size,
         sampleFiles: [...record.files].slice(0, 5),
         declaredInExtensions: record.declaredInExtensions,
+        internalizedBundledRuntimeOwners: record.internalizedBundledRuntimeOwners,
         category: classification.category,
         recommendation: classification.recommendation,
       };
@@ -269,6 +363,9 @@ export function collectRootDependencyOwnershipAudit(params = {}) {
     .toSorted((left, right) => left.depName.localeCompare(right.depName));
 }
 
+/**
+ * Returns actionable errors for dependencies that should not remain root-owned.
+ */
 export function collectRootDependencyOwnershipCheckErrors(records) {
   return records
     .filter((record) => record.category === "extension_only_localizable")
@@ -300,6 +397,9 @@ function printTextReport(records) {
       const details = [`sections=${record.sections.join(",") || "-"}`, `files=${record.fileCount}`];
       if (record.declaredInExtensions.length > 0) {
         details.push(`extensions=${record.declaredInExtensions.join(",")}`);
+      }
+      if (record.internalizedBundledRuntimeOwners.length > 0) {
+        details.push(`internalized=${record.internalizedBundledRuntimeOwners.join(",")}`);
       }
       console.log(`- ${record.depName}@${record.spec} :: ${details.join(" | ")}`);
       console.log(`  ${record.recommendation}`);

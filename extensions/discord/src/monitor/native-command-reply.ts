@@ -1,3 +1,4 @@
+// Discord plugin module implements native command reply behavior.
 import type { ReplyPayload } from "openclaw/plugin-sdk/reply-dispatch-runtime";
 import {
   resolveSendableOutboundReplyParts,
@@ -12,6 +13,8 @@ import type {
   StringSelectMenuInteraction,
   TopLevelComponents,
 } from "../internal/discord.js";
+
+export const DISCORD_EMPTY_VISIBLE_REPLY_WARNING = "⚠️ Command produced no visible reply.";
 
 export function isDiscordUnknownInteraction(error: unknown): boolean {
   if (!error || typeof error !== "object") {
@@ -90,7 +93,7 @@ export async function deliverDiscordInteractionReply(params: {
     components?: TopLevelComponents[],
   ) => {
     const contentPayload = content ? { content } : {};
-    const payload =
+    const payloadLocal =
       files && files.length > 0
         ? {
             ...contentPayload,
@@ -115,12 +118,12 @@ export async function deliverDiscordInteractionReply(params: {
           };
     await safeDiscordInteractionCall("interaction send", async () => {
       if (!preferFollowUp && !hasReplied) {
-        await interaction.reply(payload);
+        await interaction.reply(payloadLocal);
         hasReplied = true;
         firstMessageComponents = undefined;
         return;
       }
-      await interaction.followUp(payload);
+      await interaction.followUp(payloadLocal);
       hasReplied = true;
       firstMessageComponents = undefined;
     });
